@@ -1,0 +1,278 @@
+# CONFIG
+
+configOverrides:
+  custom_auth_dbview: |
+    import logging
+    import os
+
+    from celery.schedules import crontab
+    from flask_caching.backends.filesystemcache import FileSystemCache
+    from flask_appbuilder.security.views import AuthDBView
+    from superset.security import SupersetSecurityManager
+    from flask_appbuilder.const import LOGMSG_WAR_SEC_LOGIN_FAILED
+    from werkzeug.security import check_password_hash
+    import logging
+    import requests
+    from flask import session
+    log = logging.getLogger(__name__)
+    from flask_appbuilder.security.forms import LoginForm_db
+    from flask_wtf import FlaskForm
+    from wtforms import StringField, SubmitField
+
+    from flask_login import login_user, logout_user
+
+    from flask_appbuilder.views import expose, ModelView, SimpleFormView
+    from flask import jsonify
+    from flask import abort, current_app, flash, g, redirect, request, session, url_for
+    current_directory_contents = os.listdir('superset/templates')
+    print(current_directory_contents)
+    class CustomAuthDBView(AuthDBView):
+        login_template = "custom/login_db.html"
+        login_otp_template = "custom/login_db_otp.html"
+
+        @expose("/fetch_otp/", methods=["GET"])
+        def fetch_otp(self):
+            req_id = session.get('reqId')
+            if not req_id:
+                return jsonify({"error": "Session expired or invalid request ID"}), 400
+
+            otp_url = f'https://hive.dto-tech.com/hive/api/login/{req_id}/otp?lang=en'
+            headers = {
+            'Content-Type': 'application/json',
+            'recaptcha-token': ''
+            }
+            otp_response = requests.post(otp_url, headers=headers, json={})
+            otp_resp = otp_response.json()
+
+            if otp_resp.get("respCode") == "0000" and otp_resp["respData"]["sent"]:
+                return jsonify({"otp": otp_resp["respData"]["otp"]})  # Only for testing; remove in production.
+            return jsonify({"error": "Failed to fetch OTP"}), 400
+
+        @expose("/login/", methods=["GET", "POST"])
+        def login(self):
+            if g.user is not None and g.user.is_authenticated:
+                return redirect(self.appbuilder.get_url_for_index)
+
+            form = LoginForm_db()
+            if form.validate_on_submit():
+                session['username'] = form.username.data
+                session['password'] = form.password.data
+
+                # Initial Hive backend request
+                login_url = 'https://hive.dto-tech.com/hive/api/login?lang=en'
+                headers = {
+                'Content-Type': 'application/json',
+                'recaptcha-token': ''
+                }
+                login_data = {
+                    "userName": session['username'],
+                    "pwd": session['password'],
+                    "remember": "",
+                    "structType": ["INSURER"],
+                    "loginOrigin": "INCOME"
+                }
+
+                login_response = requests.post(login_url, headers=headers, json=login_data)
+                login_resp = login_response.json()
+                print(login_resp)
+                if login_resp.get("respCode") == "0000" and login_resp["respData"]["otpRequired"]:
+                    session['reqId'] = login_resp["respData"]["reqId"]
+                    session['step1_completed'] = True
+                    return redirect("/login_otp/")
+                else:
+                    flash("Login failed, user name does not match superset database", "warning")
+                    return redirect("/login/")
+            
+            return self.render_template(self.login_template, title="Login Step 1", form=form, appbuilder=self.appbuilder)
+
+        @expose("/login_otp/", methods=["GET", "POST"])
+        def login_otp(self):
+            if not session.get('step1_completed'):
+                flash("Please complete the first login step.", "warning")
+                return redirect("/login/")
+
+            req_id = session.get('reqId')
+            username = session.get('username')
+            password = session.get('password')
+
+            if not req_id or not username or not password:
+                flash("Session expired. Please log in again.", "warning")
+                return redirect("/login/")
+
+            # OTP form
+            class OTPForm(FlaskForm):
+                otp = StringField("OTP", render_kw={"placeholder": "Enter OTP"})
+                submit = SubmitField("Verify OTP")
+
+            form = OTPForm()
+            if form.validate_on_submit():
+                otp = form.otp.data
+                print("otp getting",otp)
+                session['otp'] = otp
+                # Call `auth_user_db` for final validation
+                user = self.appbuilder.sm.auth_user_db(username, password)
+                if user:
+                    login_user(user, remember=False)
+                    return redirect(session.pop('next_url', self.appbuilder.get_url_for_index))
+
+                flash("Login failed, hive user name does not match superset", "warning")
+                return redirect("/login/")
+            
+            return self.render_template(self.login_otp_template, title="Login Step 2: Enter OTP", form=form, appbuilder=self.appbuilder)
+
+    class OTPBasedSecurityManager(SupersetSecurityManager):
+        authdbview = CustomAuthDBView
+
+        def auth_user_db(self, username, password):
+            print("OTP BASE AUTH HERE WORKING TEST")
+            otp = session.get('otp')
+            if not username or not password or not otp:
+                return None
+            
+            req_id = session.get('reqId')
+            if not req_id:
+                return None
+
+            login_url = 'https://hive.dto-tech.com/hive/api/login?lang=en'
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'recaptcha-token': '',
+                'x-insmate-otp': otp  # Include OTP in headers
+            }
+            final_login_data = {
+                "userName": username,
+                "reqId": req_id,
+                "structType": ["INSURER"],
+                "loginOrigin": "INCOME"
+            }
+
+            final_response = requests.post(login_url, headers=headers, json=final_login_data)
+            final_resp = final_response.json()
+
+            if final_resp.get("respCode") == "0000":
+                user = self.find_user(username=username)
+                if user and user.is_active:
+                    self.update_user_auth_stat(user, True)
+                    return user
+                else:
+                    log.info(LOGMSG_WAR_SEC_LOGIN_FAILED, username)
+                    return None
+            else:
+                log.info("Final login failed: %s", final_resp)
+                return None
+
+    CUSTOM_SECURITY_MANAGER = OTPBasedSecurityManager
+
+# CODES HTML
+# LOGIN_DB.html
+<!-- extend base layout -->
+{% extends "appbuilder/base.html" %}
+
+
+
+{% block content %}
+
+<div class="container">
+    <div id="loginbox" style="margin-top:50px;" class="mainbox col-md-6 col-md-offset-3 col-sm-8 col-sm-offset-2">
+        <div class="panel panel-primary" >
+            <div class="panel-heading">
+                <div class="panel-title">{{ title }}</div>
+            </div>
+            <div style="padding-top:30px" class="panel-body" >
+
+                <form class="form" action="" method="post" name="login">
+                    {{form.hidden_tag()}}
+                    <div class="help-block">{{_("Enter your login and password below")}}:</div>
+                    <div class="control-group{% if form.errors.openid is defined %} error{% endif %}">
+                        <label class="control-label" for="username">{{_("Username")}}:</label>
+
+                        <div class="controls">
+                            <div class="input-group">
+                                <span class="input-group-addon"><i class="fa fa-user"></i></span>
+                                {{ form.username(size = 80, class = "form-control", autofocus = true) }}
+                            </div>
+                            {% for error in form.errors.get('openid', []) %}
+                            <span class="help-inline">[{{error}}]</span><br>
+                            {% endfor %}
+                            <label class="control-label" for="password">{{_("Password")}}:</label>
+
+                            <div class="input-group">
+                                <span class="input-group-addon"><i class="fa fa-key"></i></span>
+                                {{ form.password(size = 80, class = "form-control") }}
+                            </div>
+                            {% for error in form.errors.get('openid', []) %}
+                            <span class="help-inline">[{{error}}]</span><br>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="controls">
+                            <br>
+                            <div>
+                                <input class="btn btn-primary btn-block" type="submit" value="{{_('Sign In')}}">
+                                {% if appbuilder.sm.auth_user_registration %}
+                                <a href="{{appbuilder.sm.get_url_for_registeruser}}" class="btn btn-block btn-primary" data-toggle="tooltip" rel="tooltip"
+                                title="{{_('If you are not already a user, please register')}}">
+                                    {{_('Register')}}
+                                </a>
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+                </form>
+
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+# LOGIN_DB_OTP.HTML
+{% extends "appbuilder/base.html" %}
+
+{% block content %}
+<div class="container">
+    <div id="otpbox" style="margin-top:50px;" class="mainbox col-md-6 col-md-offset-3 col-sm-8 col-sm-offset-2">
+        <div class="panel panel-primary">
+            <div class="panel-heading">
+                <div class="panel-title">{{ title }}</div>
+            </div>
+            <div style="padding-top:30px" class="panel-body">
+                <form class="form" action="" method="post" name="otp">
+                    {{ form.hidden_tag() }}
+                    <div class="help-block">{{ _("Enter your OTP below") }}:</div>
+                    <div class="control-group{% if form.errors.otp is defined %} error{% endif %}">
+                        <label class="control-label" for="otp">{{ _("OTP") }}:</label>
+                        <div class="controls">
+                            <div class="input-group">
+                                <span class="input-group-addon"><i class="fa fa-key"></i></span>
+                                {{ form.otp(size=80, class="form-control", autofocus=true) }}
+                            </div>
+                            {% for error in form.errors.get('otp', []) %}
+                            <span class="help-inline">[{{ error }}]</span><br>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <button type="button" class="btn btn-info" id="fetch-otp-btn">
+                            {{ _("Fetch OTP") }}
+                        </button>
+                        <p id="otp-display" style="margin-top: 10px; font-weight: bold;"></p>
+                    </div>
+                    <div class="control-group">
+                        <div class="controls">
+                            <br>
+                            <input class="btn btn-primary btn-block" type="submit" value="{{ _('Verify OTP') }}">
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+<script src="{{ url_for('static', filename='js/otp_script.js') }}"></script>
+
+{% endblock %}
