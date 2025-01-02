@@ -276,3 +276,35 @@ configOverrides:
 <script src="{{ url_for('static', filename='js/otp_script.js') }}"></script>
 
 {% endblock %}
+
+
+
+document.addEventListener("DOMContentLoaded", function () {
+  document.getElementById("fetch-otp-btn").addEventListener("click", function () {
+    fetch("/fetch_otp/")
+      .then(response => response.json())
+      .then(data => {
+        const otpInput = document.querySelector('input[name="otp"]');
+        const otpDisplay = document.getElementById("otp-display");
+
+        if (data.otp) {
+          // Set the value of the OTP input field
+          otpInput.value = data.otp;
+
+          // Optionally clear the display text
+          otpDisplay.innerText = '';
+        } else {
+          // Display error message
+          otpInput.value = ''; // Clear OTP input field on error
+          otpDisplay.innerText = `Error: ${data.error}`;
+        }
+      })
+      .catch(error => {
+        console.error("Error fetching OTP:", error);
+
+        // Handle error by clearing OTP input field and showing error message
+        document.querySelector('input[name="otp"]').value = '';
+        document.getElementById("otp-display").innerText = 'Error fetching OTP';
+      });
+    });
+});
